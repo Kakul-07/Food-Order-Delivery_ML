@@ -1,0 +1,49 @@
+{
+  "selected_model": "Random Forest",
+  "target": "delivery duration in minutes",
+  "feature_columns": [
+    "Delivery_person_Age",
+    "Delivery_person_Ratings",
+    "Restaurant_latitude",
+    "Restaurant_longitude",
+    "Delivery_location_latitude",
+    "Delivery_location_longitude",
+    "Vehicle_condition",
+    "distance_km",
+    "order_hour",
+    "order_minute",
+    "order_weekday",
+    "order_month",
+    "Weatherconditions",
+    "Road_traffic_density",
+    "Type_of_order",
+    "Type_of_vehicle",
+    "Festival",
+    "City"
+  ],
+  "numeric_features": [
+    "Delivery_person_Age",
+    "Delivery_person_Ratings",
+    "Restaurant_latitude",
+    "Restaurant_longitude",
+    "Delivery_location_latitude",
+    "Delivery_location_longitude",
+    "Vehicle_condition",
+    "distance_km",
+    "order_hour",
+    "order_minute",
+    "order_weekday",
+    "order_month"
+  ],
+  "categorical_features": [
+    "Weatherconditions",
+    "Road_traffic_density",
+    "Type_of_order",
+    "Type_of_vehicle",
+    "Festival",
+    "City"
+  ],
+  "training_rows": 45593,
+  "validation_split": "random 80/20; random_state=42",
+  "note": "Offline prototype. Evaluate time-based validation and production drift before deployment."
+}
