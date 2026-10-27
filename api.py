@@ -12,7 +12,8 @@ import numpy as np
 import pandas as pd
 
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
 
 # ============================================================
@@ -49,6 +50,20 @@ app = FastAPI(
     ),
     version="1.0.0",
 )
+import os
+
+_frontend_origins = [
+    origin.strip()
+    for origin in os.getenv("FRONTEND_ORIGINS", "*").split(",")
+    if origin.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_frontend_origins,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ============================================================
@@ -71,20 +86,36 @@ if MODEL_PATH.exists() and METADATA_PATH.exists():
 # ============================================================
 
 class DeliveryPredictionRequest(BaseModel):
-    Delivery_person_Age: Optional[float] = None
-    Delivery_person_Ratings: Optional[float] = None
+    """Validated request body for delivery-time prediction.
 
-    Restaurant_latitude: Optional[float] = None
-    Restaurant_longitude: Optional[float] = None
+    Fields are optional for compatibility with the existing API. The model
+    preprocessing layer handles missing values using the same approach as
+    the original service. Frontend-provided route distance is preferred.
+    """
 
-    Delivery_location_latitude: Optional[float] = None
-    Delivery_location_longitude: Optional[float] = None
+    Delivery_person_Age: Optional[float] = Field(default=None, ge=18, le=80)
+    Delivery_person_Ratings: Optional[float] = Field(default=None, ge=0, le=5)
 
-    Vehicle_condition: Optional[float] = None
+    Restaurant_latitude: Optional[float] = Field(default=None, ge=-90, le=90)
+    Restaurant_longitude: Optional[float] = Field(default=None, ge=-180, le=180)
+    Delivery_location_latitude: Optional[float] = Field(default=None, ge=-90, le=90)
+    Delivery_location_longitude: Optional[float] = Field(default=None, ge=-180, le=180)
+
+    Vehicle_condition: Optional[float] = Field(default=None, ge=0, le=5)
+
+    # Route distance from the frontend Maps API, in kilometres.
+    distance_km: Optional[float] = Field(default=None, gt=0, le=1000)
+
+    # Explicit time features; when omitted, derive them from time/date fields.
+    order_hour: Optional[int] = Field(default=None, ge=0, le=23)
+    order_minute: Optional[int] = Field(default=None, ge=0, le=59)
+    order_weekday: Optional[int] = Field(default=None, ge=0, le=6)
+    order_month: Optional[int] = Field(default=None, ge=1, le=12)
 
     Time_Orderd: Optional[str] = None
     Order_Date: Optional[str] = None
 
+    # Values are supplied by the frontend Weather API / existing traffic source.
     Weatherconditions: Optional[str] = None
     Road_traffic_density: Optional[str] = None
 
@@ -155,11 +186,16 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
             errors="coerce",
         )
 
-    # Calculate straight-line distance using Haversine formula.
+    if "distance_km" not in x.columns:
+        x["distance_km"] = np.nan
+
+    x["distance_km"] = pd.to_numeric(
+        x["distance_km"],
+        errors="coerce",
+    )
 
     lat1 = np.radians(x["Restaurant_latitude"])
     lon1 = np.radians(x["Restaurant_longitude"])
-
     lat2 = np.radians(x["Delivery_location_latitude"])
     lon2 = np.radians(x["Delivery_location_longitude"])
 
@@ -170,14 +206,16 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         * np.sin((lon2 - lon1) / 2) ** 2
     )
 
-    x["distance_km"] = (
+    straight_line_distance = (
         6371
         * 2
         * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
     )
 
-    # Extract order time.
-
+    x["distance_km"] = x["distance_km"].where(
+        x["distance_km"].notna(),
+        straight_line_distance,
+    )
     if "Time_Orderd" not in x.columns:
         x["Time_Orderd"] = np.nan
 
@@ -185,27 +223,50 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         x["Order_Date"] = np.nan
 
     time_parts = x["Time_Orderd"].apply(parse_order_time)
+    derived_hour = time_parts.map(lambda value: value[0])
+    derived_minute = time_parts.map(lambda value: value[1])
 
-    x["order_hour"] = time_parts.map(
-        lambda value: value[0]
+    x["order_hour"] = pd.to_numeric(
+        x.get("order_hour", pd.Series(np.nan, index=x.index)),
+        errors="coerce",
+    ).where(
+        pd.to_numeric(
+            x.get("order_hour", pd.Series(np.nan, index=x.index)),
+            errors="coerce",
+        ).notna(),
+        derived_hour,
     )
 
-    x["order_minute"] = time_parts.map(
-        lambda value: value[1]
+    x["order_minute"] = pd.to_numeric(
+        x.get("order_minute", pd.Series(np.nan, index=x.index)),
+        errors="coerce",
+    ).where(
+        pd.to_numeric(
+            x.get("order_minute", pd.Series(np.nan, index=x.index)),
+            errors="coerce",
+        ).notna(),
+        derived_minute,
     )
-
-    # Extract date-related features.
 
     dates = pd.to_datetime(
         x["Order_Date"],
         errors="coerce",
         dayfirst=True,
     )
+    derived_weekday = dates.dt.dayofweek
+    derived_month = dates.dt.month
 
-    x["order_weekday"] = dates.dt.dayofweek
-    x["order_month"] = dates.dt.month
+    for col, derived in [
+        ("order_weekday", derived_weekday),
+        ("order_month", derived_month),
+    ]:
+        supplied = pd.to_numeric(
+            x.get(col, pd.Series(np.nan, index=x.index)),
+            errors="coerce",
+        )
+        x[col] = supplied.where(supplied.notna(), derived)
 
-    # Clean categorical features.
+
 
     categorical_columns = [
         "Weatherconditions",
@@ -240,7 +301,6 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
             np.nan,
         )
 
-    # Use exactly the features expected by the trained model.
 
     feature_columns = metadata.get("feature_columns")
 
@@ -436,7 +496,6 @@ def recommend_restaurants(
 
     restaurants = get_restaurants().copy()
 
-    # Ensure expected columns exist.
 
     for col in [
         "restaurant_name",
@@ -478,8 +537,6 @@ def recommend_restaurants(
         else 0.0
     )
 
-    # Bayesian-style ranking score.
-
     m = (
         float(
             restaurants["rating_count"].quantile(0.75)
@@ -504,7 +561,6 @@ def recommend_restaurants(
             restaurants["rating"].fillna(global_mean)
         )
 
-    # Apply filters.
 
     if cuisine:
         restaurants = restaurants[
@@ -541,7 +597,6 @@ def recommend_restaurants(
             restaurants["rating"].ge(min_rating)
         ]
 
-    # Sort and limit results.
 
     restaurants = restaurants.sort_values(
         ["ranking_score", "rating_count"],
@@ -602,7 +657,6 @@ def recommend_from_previous_orders(
 
     orders = get_order_history().copy()
 
-    # Normalize customer IDs to avoid integer/string mismatches.
 
     orders["customer_id_normalized"] = (
         orders["customer_id"].map(normalize_id)
@@ -622,9 +676,6 @@ def recommend_from_previous_orders(
                 f"'{customer_id}' in the available dataset."
             ),
         )
-
-    # Clean cuisine values.
-
     customer_orders["cuisine_type"] = (
         customer_orders["cuisine_type"]
         .fillna("")
@@ -645,8 +696,6 @@ def recommend_from_previous_orders(
             ),
         )
 
-    # Find the most frequently ordered cuisine.
-
     cuisine_counts = (
         customer_orders["cuisine_type"].value_counts()
     )
@@ -655,7 +704,6 @@ def recommend_from_previous_orders(
         cuisine_counts.index[0]
     )
 
-    # Return restaurants matching that cuisine.
 
     matching = recommend_restaurants(
         cuisine=preferred_cuisine,
