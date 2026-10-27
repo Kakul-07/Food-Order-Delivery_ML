@@ -50,6 +50,11 @@ app = FastAPI(
     ),
     version="1.0.0",
 )
+
+# Frontend calls are browser-originated. Restrict this list to your deployed
+# frontend domain(s) with FRONTEND_ORIGINS in production, comma-separated.
+# The wildcard fallback is convenient for initial testing; it does not enable
+# credentialed cookies.
 import os
 
 _frontend_origins = [
@@ -186,6 +191,8 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
             errors="coerce",
         )
 
+    # Prefer route distance supplied by the frontend Maps API.
+    # Fall back to straight-line Haversine distance if it is not supplied.
     if "distance_km" not in x.columns:
         x["distance_km"] = np.nan
 
@@ -216,6 +223,8 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         x["distance_km"].notna(),
         straight_line_distance,
     )
+
+    # Derive time features, then prefer explicit frontend values when present.
     if "Time_Orderd" not in x.columns:
         x["Time_Orderd"] = np.nan
 
@@ -266,7 +275,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         )
         x[col] = supplied.where(supplied.notna(), derived)
 
-
+    # Clean categorical features.
 
     categorical_columns = [
         "Weatherconditions",
@@ -301,6 +310,7 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
             np.nan,
         )
 
+    # Use exactly the features expected by the trained model.
 
     feature_columns = metadata.get("feature_columns")
 
@@ -496,6 +506,7 @@ def recommend_restaurants(
 
     restaurants = get_restaurants().copy()
 
+    # Ensure expected columns exist.
 
     for col in [
         "restaurant_name",
@@ -537,6 +548,8 @@ def recommend_restaurants(
         else 0.0
     )
 
+    # Bayesian-style ranking score.
+
     m = (
         float(
             restaurants["rating_count"].quantile(0.75)
@@ -561,6 +574,7 @@ def recommend_restaurants(
             restaurants["rating"].fillna(global_mean)
         )
 
+    # Apply filters.
 
     if cuisine:
         restaurants = restaurants[
@@ -597,6 +611,7 @@ def recommend_restaurants(
             restaurants["rating"].ge(min_rating)
         ]
 
+    # Sort and limit results.
 
     restaurants = restaurants.sort_values(
         ["ranking_score", "rating_count"],
@@ -640,99 +655,110 @@ def recommend_from_previous_orders(
     customer_id: str = Query(
         ...,
         min_length=1,
-        description=(
-            "Customer ID present in the order-history dataset"
-        ),
+        description="Customer ID present in the order-history dataset",
     ),
-    limit: int = Query(
-        default=10,
-        ge=1,
-        le=100,
-    ),
+    limit: int = Query(default=10, ge=1, le=100),
 ):
-    """
-    Find the customer's most frequently ordered cuisine
-    and return restaurants matching that cuisine.
-    """
+    """Personalize restaurant recommendations using a customer's order history.
 
+    The endpoint learns cuisine preferences from the customer's historical
+    orders, ranks cuisines by frequency, and combines recommendations from
+    the strongest preferences. It gracefully handles datasets that do not
+    contain order dates or restaurant names.
+    """
     orders = get_order_history().copy()
-
-
-    orders["customer_id_normalized"] = (
-        orders["customer_id"].map(normalize_id)
-    )
-
+    orders["customer_id_normalized"] = orders["customer_id"].map(normalize_id)
     customer_orders = orders[
-        orders["customer_id_normalized"].eq(
-            normalize_id(customer_id)
-        )
+        orders["customer_id_normalized"].eq(normalize_id(customer_id))
     ].copy()
 
     if customer_orders.empty:
         raise HTTPException(
             status_code=404,
-            detail=(
-                f"No previous orders found for customer_id "
-                f"'{customer_id}' in the available dataset."
-            ),
+            detail=(f"No previous orders found for customer_id '{customer_id}' "
+                    "in the available dataset."),
         )
+
     customer_orders["cuisine_type"] = (
-        customer_orders["cuisine_type"]
-        .fillna("")
-        .astype(str)
-        .str.strip()
+        customer_orders["cuisine_type"].fillna("").astype(str).str.strip()
     )
-
-    customer_orders = customer_orders[
-        customer_orders["cuisine_type"].ne("")
-    ]
-
+    customer_orders = customer_orders[customer_orders["cuisine_type"].ne("")]
     if customer_orders.empty:
         raise HTTPException(
             status_code=404,
-            detail=(
-                "Previous orders were found, but none had "
-                "a recorded cuisine type."
-            ),
+            detail="Previous orders were found, but none had a recorded cuisine type.",
         )
 
-    cuisine_counts = (
-        customer_orders["cuisine_type"].value_counts()
-    )
+    # If an order date/time column exists, sort newest-first and apply a mild
+    # recency weighting; otherwise use frequency only (works with simpler CSVs).
+    date_col = next((c for c in ["order_date", "Order_Date", "order_timestamp",
+                                  "order_time", "created_at", "timestamp"]
+                     if c in customer_orders.columns), None)
+    if date_col:
+        dates = pd.to_datetime(customer_orders[date_col], errors="coerce")
+        if dates.notna().any():
+            customer_orders["_order_date"] = dates
+            customer_orders = customer_orders.sort_values("_order_date")
+            # Newer rows receive larger weights. A simple rank weight avoids
+            # assumptions about the date format or elapsed-time scale.
+            customer_orders["_recency_weight"] = np.arange(
+                1, len(customer_orders) + 1, dtype=float
+            )
+        else:
+            customer_orders["_recency_weight"] = 1.0
+    else:
+        customer_orders["_recency_weight"] = 1.0
 
-    preferred_cuisine = str(
-        cuisine_counts.index[0]
+    cuisine_stats = (
+        customer_orders.groupby("cuisine_type", as_index=False)
+        .agg(order_count=("cuisine_type", "size"),
+             preference_score=("_recency_weight", "sum"))
+        .sort_values(["preference_score", "order_count"], ascending=False)
     )
+    top_cuisines = cuisine_stats.head(min(3, len(cuisine_stats)))
 
-
-    matching = recommend_restaurants(
-        cuisine=preferred_cuisine,
-        location=None,
-        max_price=None,
-        min_rating=None,
-        limit=limit,
-    )
+    # Allocate a recommendation quota across the user's top cuisine preferences.
+    # Dedupe by restaurant name (or the full record if no name is available).
+    collected = []
+    seen = set()
+    for _, cuisine_row in top_cuisines.iterrows():
+        cuisine = str(cuisine_row["cuisine_type"])
+        quota = max(1, limit // len(top_cuisines))
+        result = recommend_restaurants(
+            cuisine=cuisine, location=None, max_price=None,
+            min_rating=None, limit=min(100, quota + 3),
+        )
+        for restaurant in result.get("restaurants", []):
+            name = str(restaurant.get("restaurant_name", "")).strip().casefold()
+            key = name if name else json.dumps(restaurant, sort_keys=True, default=str)
+            if key in seen:
+                continue
+            seen.add(key)
+            restaurant = dict(restaurant)
+            restaurant["matched_preferred_cuisine"] = cuisine
+            restaurant["customer_cuisine_order_count"] = int(cuisine_row["order_count"])
+            collected.append(restaurant)
+            if len(collected) >= limit:
+                break
+        if len(collected) >= limit:
+            break
 
     return {
         "customer_id": normalize_id(customer_id),
-        "preferred_cuisine": preferred_cuisine,
-        "previous_orders_in_cuisine": int(
-            cuisine_counts.iloc[0]
-        ),
-        "total_previous_orders_with_cuisine": int(
-            len(customer_orders)
-        ),
-        "count": matching["count"],
-        "restaurants": matching["restaurants"],
+        "total_historical_orders_with_cuisine": int(len(customer_orders)),
+        "preferred_cuisines": [
+            {"cuisine": str(row["cuisine_type"]),
+             "order_count": int(row["order_count"]),
+             "preference_score": round(float(row["preference_score"]), 3)}
+            for _, row in top_cuisines.iterrows()
+        ],
+        "count": len(collected),
+        "restaurants": collected,
+        "personalization": "ranked using customer cuisine frequency and, when available, order recency",
         "message": (
-            (
-                "Showing restaurants matching the customer's "
-                f"most frequently ordered cuisine: {preferred_cuisine}."
-            )
-            if matching["count"]
-            else (
-                "No restaurant listings matched the "
-                f"previous-order cuisine '{preferred_cuisine}'."
-            )
+            "Recommendations are based on this customer's historical cuisine preferences."
+            if collected else
+            "Customer history was found, but no listed restaurants matched the customer's preferred cuisines."
         ),
     }
+
