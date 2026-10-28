@@ -1,7 +1,3 @@
-"""FastAPI endpoints for the Food Ordering & Delivery ML project."""
-
-from __future__ import annotations
-
 import json
 import re
 from pathlib import Path
@@ -10,755 +6,853 @@ from typing import Optional
 import joblib
 import numpy as np
 import pandas as pd
-
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
 # ============================================================
-# 1. PROJECT PATHS
+# CONFIGURATION
 # ============================================================
 
-ROOT = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+PROCESSED_DIR = DATA_DIR / "processed"
+MODELS_DIR = BASE_DIR / "models"
 
-MODEL_PATH = ROOT / "models" / "delivery_eta.joblib"
-METADATA_PATH = ROOT / "models" / "delivery_eta_metadata.json"
+DELIVERY_MODEL_PATH = MODELS_DIR / "delivery_eta.joblib"
+DELIVERY_METADATA_PATH = MODELS_DIR / "delivery_eta_metadata.json"
 
-RESTAURANTS_PATH = (
-    ROOT / "data" / "processed" / "restaurants_clean.csv"
+RESTAURANT_MODEL_PATH = (
+    MODELS_DIR / "restaurant_recommendation_model.joblib"
+)
+PREVIOUS_ORDER_MODEL_PATH = (
+    MODELS_DIR / "previous_order_model.joblib"
 )
 
-ORDER_HISTORY_PATH = (
-    ROOT / "data" / "raw" / "online_food_orders.csv"
-)
-
-CLEAN_ORDER_HISTORY_PATH = (
-    ROOT / "data" / "processed" / "online_orders_clean.csv"
-)
+ORDERS_DATA_PATH = PROCESSED_DIR / "online_orders_clean.csv"
+RESTAURANTS_DATA_PATH = PROCESSED_DIR / "restaurants_clean.csv"
 
 
 # ============================================================
-# 2. FASTAPI APPLICATION
+# FASTAPI APPLICATION
 # ============================================================
 
 app = FastAPI(
-    title="Food Ordering & Delivery ML API",
+    title="Food Ordering and Delivery ML API",
     description=(
-        "API for delivery-time prediction, restaurant ranking, "
-        "and previous-order-based recommendations."
+        "API for delivery-time prediction, restaurant recommendations, "
+        "and customer order-history recommendations."
     ),
     version="1.0.0",
 )
 
-# Frontend calls are browser-originated. Restrict this list to your deployed
-# frontend domain(s) with FRONTEND_ORIGINS in production, comma-separated.
-# The wildcard fallback is convenient for initial testing; it does not enable
-# credentialed cookies.
-import os
 
-_frontend_origins = [
-    origin.strip()
-    for origin in os.getenv("FRONTEND_ORIGINS", "*").split(",")
-    if origin.strip()
-]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_frontend_origins,
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ============================================================
+# LOAD MODEL ARTIFACTS
+# ============================================================
+
+def load_joblib(path: Path):
+    if not path.exists():
+        print(f"[WARNING] Model artifact not found: {path}")
+        return None
+
+    try:
+        artifact = joblib.load(path)
+        print(f"[INFO] Loaded artifact: {path.name}")
+        return artifact
+    except Exception as exc:
+        print(f"[ERROR] Could not load {path.name}: {exc}")
+        return None
+
+
+def load_json(path: Path):
+    if not path.exists():
+        print(f"[WARNING] Metadata file not found: {path}")
+        return {}
+
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            return json.load(file)
+    except Exception as exc:
+        print(f"[ERROR] Could not load metadata: {exc}")
+        return {}
+
+
+def load_csv(path: Path):
+    if not path.exists():
+        print(f"[WARNING] CSV file not found: {path}")
+        return pd.DataFrame()
+
+    try:
+        return pd.read_csv(path)
+    except Exception as exc:
+        print(f"[ERROR] Could not read {path.name}: {exc}")
+        return pd.DataFrame()
+
+
+delivery_model = load_joblib(DELIVERY_MODEL_PATH)
+delivery_metadata = load_json(DELIVERY_METADATA_PATH)
+
+restaurant_model_artifact = load_joblib(RESTAURANT_MODEL_PATH)
+previous_order_model_artifact = load_joblib(PREVIOUS_ORDER_MODEL_PATH)
+
+orders_df = load_csv(ORDERS_DATA_PATH)
+restaurants_df = load_csv(RESTAURANTS_DATA_PATH)
 
 
 # ============================================================
-# 3. LOAD TRAINED MODEL
+# GENERAL HELPERS
 # ============================================================
 
-model = None
-metadata = {}
+def normalize_column_name(name: str) -> str:
+    name = str(name).strip().lower()
+    name = re.sub(r"[^a-z0-9]+", "_", name)
+    return name.strip("_")
 
-if MODEL_PATH.exists() and METADATA_PATH.exists():
-    model = joblib.load(MODEL_PATH)
 
-    metadata = json.loads(
-        METADATA_PATH.read_text(encoding="utf-8")
-    )
+def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+
+    result = df.copy()
+    result.columns = [normalize_column_name(c) for c in result.columns]
+    return result
+
+
+def find_column(
+    df: pd.DataFrame,
+    candidates: list[str],
+) -> Optional[str]:
+    """Find a column using possible names."""
+    if df.empty:
+        return None
+
+    normalized = {
+        normalize_column_name(column): column
+        for column in df.columns
+    }
+
+    for candidate in candidates:
+        key = normalize_column_name(candidate)
+        if key in normalized:
+            return normalized[key]
+
+    return None
+
+
+def to_float(value, default=0.0) -> float:
+    try:
+        if value is None or pd.isna(value):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_text(value) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip().lower()
+
+
+def get_restaurants() -> pd.DataFrame:
+    """
+    Load restaurant rows from the recommendation artifact when available.
+    Fall back to restaurants_clean.csv.
+    """
+    if isinstance(restaurant_model_artifact, dict):
+        records = restaurant_model_artifact.get("restaurants")
+
+        if isinstance(records, pd.DataFrame):
+            return normalize_dataframe(records)
+
+        if isinstance(records, list):
+            return normalize_dataframe(pd.DataFrame(records))
+
+    if not restaurants_df.empty:
+        return normalize_dataframe(restaurants_df)
+
+    if not orders_df.empty:
+        # Last-resort catalogue built from the order dataset.
+        df = normalize_dataframe(orders_df)
+
+        name_col = find_column(
+            df, ["restaurant_name", "restaurant", "name"]
+        )
+
+        if name_col:
+            return df.drop_duplicates(subset=[name_col]).reset_index(
+                drop=True
+            )
+
+    return pd.DataFrame()
 
 
 # ============================================================
-# 4. DELIVERY PREDICTION REQUEST
+# DELIVERY PREDICTION
 # ============================================================
 
 class DeliveryPredictionRequest(BaseModel):
-    """Validated request body for delivery-time prediction.
+    age: Optional[float] = Field(default=None, alias="Age")
+    ratings: Optional[float] = Field(default=None, alias="Ratings")
 
-    Fields are optional for compatibility with the existing API. The model
-    preprocessing layer handles missing values using the same approach as
-    the original service. Frontend-provided route distance is preferred.
-    """
-
-    Delivery_person_Age: Optional[float] = Field(default=None, ge=18, le=80)
-    Delivery_person_Ratings: Optional[float] = Field(default=None, ge=0, le=5)
-
-    Restaurant_latitude: Optional[float] = Field(default=None, ge=-90, le=90)
-    Restaurant_longitude: Optional[float] = Field(default=None, ge=-180, le=180)
-    Delivery_location_latitude: Optional[float] = Field(default=None, ge=-90, le=90)
-    Delivery_location_longitude: Optional[float] = Field(default=None, ge=-180, le=180)
-
-    Vehicle_condition: Optional[float] = Field(default=None, ge=0, le=5)
-
-    # Route distance from the frontend Maps API, in kilometres.
-    distance_km: Optional[float] = Field(default=None, gt=0, le=1000)
-
-    # Explicit time features; when omitted, derive them from time/date fields.
-    order_hour: Optional[int] = Field(default=None, ge=0, le=23)
-    order_minute: Optional[int] = Field(default=None, ge=0, le=59)
-    order_weekday: Optional[int] = Field(default=None, ge=0, le=6)
-    order_month: Optional[int] = Field(default=None, ge=1, le=12)
-
-    Time_Orderd: Optional[str] = None
-    Order_Date: Optional[str] = None
-
-    # Values are supplied by the frontend Weather API / existing traffic source.
-    Weatherconditions: Optional[str] = None
-    Road_traffic_density: Optional[str] = None
-
-    Type_of_order: Optional[str] = None
-    Type_of_vehicle: Optional[str] = None
-
-    Festival: Optional[str] = None
-    City: Optional[str] = None
-
-
-# ============================================================
-# 5. HELPER FUNCTIONS FOR DELIVERY PREDICTION
-# ============================================================
-
-def parse_order_time(value):
-    """Convert an order time into hour and minute."""
-
-    if value is None or pd.isna(value):
-        return np.nan, np.nan
-
-    match = re.match(
-        r"^\s*(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?\s*$",
-        str(value),
-        re.I,
+    restaurant_latitude: Optional[float] = Field(
+        default=None, alias="Restaurant_latitude"
+    )
+    restaurant_longitude: Optional[float] = Field(
+        default=None, alias="Restaurant_longitude"
+    )
+    delivery_location_latitude: Optional[float] = Field(
+        default=None, alias="Delivery_location_latitude"
+    )
+    delivery_location_longitude: Optional[float] = Field(
+        default=None, alias="Delivery_location_longitude"
     )
 
-    if not match:
-        return np.nan, np.nan
-
-    hour = int(match.group(1))
-    minute = int(match.group(2))
-
-    suffix = (match.group(3) or "").upper()
-
-    if suffix == "PM" and hour < 12:
-        hour += 12
-
-    if suffix == "AM" and hour == 12:
-        hour = 0
-
-    if hour > 23 or minute > 59:
-        return np.nan, np.nan
-
-    return hour, minute
-
-
-def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Prepare input features for the trained delivery model."""
-
-    x = df.copy()
-
-    numeric_columns = [
-        "Delivery_person_Age",
-        "Delivery_person_Ratings",
-        "Restaurant_latitude",
-        "Restaurant_longitude",
-        "Delivery_location_latitude",
-        "Delivery_location_longitude",
-        "Vehicle_condition",
-    ]
-
-    for col in numeric_columns:
-        if col not in x.columns:
-            x[col] = np.nan
-
-        x[col] = pd.to_numeric(
-            x[col],
-            errors="coerce",
-        )
-
-    # Prefer route distance supplied by the frontend Maps API.
-    # Fall back to straight-line Haversine distance if it is not supplied.
-    if "distance_km" not in x.columns:
-        x["distance_km"] = np.nan
-
-    x["distance_km"] = pd.to_numeric(
-        x["distance_km"],
-        errors="coerce",
+    weather_conditions: Optional[str] = Field(
+        default=None, alias="Weather_conditions"
+    )
+    road_traffic_density: Optional[str] = Field(
+        default=None, alias="Road_traffic_density"
+    )
+    vehicle_condition: Optional[float] = Field(
+        default=None, alias="Vehicle_condition"
+    )
+    type_of_order: Optional[str] = Field(
+        default=None, alias="Type_of_order"
+    )
+    type_of_vehicle: Optional[str] = Field(
+        default=None, alias="Type_of_vehicle"
+    )
+    multiple_deliveries: Optional[float] = Field(
+        default=None, alias="multiple_deliveries"
+    )
+    festival: Optional[str] = Field(default=None, alias="Festival")
+    city: Optional[str] = Field(default=None, alias="City")
+    time_ordered: Optional[str] = Field(
+        default=None, alias="Time_Orderd"
+    )
+    time_order_picked: Optional[str] = Field(
+        default=None, alias="Time_Order_picked"
+    )
+    distance_km: Optional[float] = Field(
+        default=None, alias="distance_km"
     )
 
-    lat1 = np.radians(x["Restaurant_latitude"])
-    lon1 = np.radians(x["Restaurant_longitude"])
-    lat2 = np.radians(x["Delivery_location_latitude"])
-    lon2 = np.radians(x["Delivery_location_longitude"])
-
-    a = (
-        np.sin((lat2 - lat1) / 2) ** 2
-        + np.cos(lat1)
-        * np.cos(lat2)
-        * np.sin((lon2 - lon1) / 2) ** 2
-    )
-
-    straight_line_distance = (
-        6371
-        * 2
-        * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
-    )
-
-    x["distance_km"] = x["distance_km"].where(
-        x["distance_km"].notna(),
-        straight_line_distance,
-    )
-
-    # Derive time features, then prefer explicit frontend values when present.
-    if "Time_Orderd" not in x.columns:
-        x["Time_Orderd"] = np.nan
-
-    if "Order_Date" not in x.columns:
-        x["Order_Date"] = np.nan
-
-    time_parts = x["Time_Orderd"].apply(parse_order_time)
-    derived_hour = time_parts.map(lambda value: value[0])
-    derived_minute = time_parts.map(lambda value: value[1])
-
-    x["order_hour"] = pd.to_numeric(
-        x.get("order_hour", pd.Series(np.nan, index=x.index)),
-        errors="coerce",
-    ).where(
-        pd.to_numeric(
-            x.get("order_hour", pd.Series(np.nan, index=x.index)),
-            errors="coerce",
-        ).notna(),
-        derived_hour,
-    )
-
-    x["order_minute"] = pd.to_numeric(
-        x.get("order_minute", pd.Series(np.nan, index=x.index)),
-        errors="coerce",
-    ).where(
-        pd.to_numeric(
-            x.get("order_minute", pd.Series(np.nan, index=x.index)),
-            errors="coerce",
-        ).notna(),
-        derived_minute,
-    )
-
-    dates = pd.to_datetime(
-        x["Order_Date"],
-        errors="coerce",
-        dayfirst=True,
-    )
-    derived_weekday = dates.dt.dayofweek
-    derived_month = dates.dt.month
-
-    for col, derived in [
-        ("order_weekday", derived_weekday),
-        ("order_month", derived_month),
-    ]:
-        supplied = pd.to_numeric(
-            x.get(col, pd.Series(np.nan, index=x.index)),
-            errors="coerce",
-        )
-        x[col] = supplied.where(supplied.notna(), derived)
-
-    # Clean categorical features.
-
-    categorical_columns = [
-        "Weatherconditions",
-        "Road_traffic_density",
-        "Type_of_order",
-        "Type_of_vehicle",
-        "Festival",
-        "City",
-    ]
-
-    for col in categorical_columns:
-        if col not in x.columns:
-            x[col] = np.nan
-
-        x[col] = (
-            x[col]
-            .astype("string")
-            .str.strip()
-            .replace(
-                {
-                    "": pd.NA,
-                    "NaN": pd.NA,
-                    "nan": pd.NA,
-                    "conditions NaN": pd.NA,
-                }
-            )
-            .astype(object)
-        )
-
-        x[col] = x[col].where(
-            pd.notna(x[col]),
-            np.nan,
-        )
-
-    # Use exactly the features expected by the trained model.
-
-    feature_columns = metadata.get("feature_columns")
-
-    if not feature_columns:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Model metadata is missing. "
-                "Run notebook 04 to train and export the model."
-            ),
-        )
-
-    for col in feature_columns:
-        if col not in x.columns:
-            x[col] = np.nan
-
-    return x[feature_columns]
-
-
-# ============================================================
-# 6. LOAD RESTAURANT DATA
-# ============================================================
-
-def get_restaurants() -> pd.DataFrame:
-    """Load the cleaned restaurant listing dataset."""
-
-    if not RESTAURANTS_PATH.exists():
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Clean restaurant data is missing. "
-                "Run notebook 02_cleaning_and_preprocessing.ipynb."
-            ),
-        )
-
-    return pd.read_csv(
-        RESTAURANTS_PATH,
-        low_memory=False,
-    )
-
-
-# ============================================================
-# 7. LOAD CUSTOMER ORDER HISTORY
-# ============================================================
-
-def get_order_history() -> pd.DataFrame:
-    """Load historical orders for cuisine recommendations."""
-
-    if CLEAN_ORDER_HISTORY_PATH.exists():
-        path = CLEAN_ORDER_HISTORY_PATH
-    else:
-        path = ORDER_HISTORY_PATH
-
-    if not path.exists():
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Order history is missing. Add "
-                "data/raw/online_food_orders.csv or generate "
-                "data/processed/online_orders_clean.csv."
-            ),
-        )
-
-    orders = pd.read_csv(
-        path,
-        low_memory=False,
-    )
-
-    required_columns = {
-        "customer_id",
-        "cuisine_type",
+    model_config = {
+        "populate_by_name": True,
+        "extra": "allow",
     }
 
-    if not required_columns.issubset(orders.columns):
+
+def parse_order_time(value):
+    if value is None:
+        return None
+
+    text = str(value).strip()
+
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return None
+
+    for fmt in ("%H:%M:%S", "%H:%M", "%I:%M %p"):
+        try:
+            return pd.to_datetime(text, format=fmt)
+        except (ValueError, TypeError):
+            continue
+
+    try:
+        return pd.to_datetime(text)
+    except (ValueError, TypeError):
+        return None
+
+
+def calculate_distance_km(
+    lat1,
+    lon1,
+    lat2,
+    lon2,
+):
+    """Calculate distance between two coordinates using Haversine."""
+    values = [lat1, lon1, lat2, lon2]
+
+    if any(value is None for value in values):
+        return None
+
+    try:
+        lat1, lon1, lat2, lon2 = map(float, values)
+    except (ValueError, TypeError):
+        return None
+
+    radius = 6371.0
+
+    lat1_rad = np.radians(lat1)
+    lat2_rad = np.radians(lat2)
+
+    delta_lat = np.radians(lat2 - lat1)
+    delta_lon = np.radians(lon2 - lon1)
+
+    a = (
+        np.sin(delta_lat / 2) ** 2
+        + np.cos(lat1_rad)
+        * np.cos(lat2_rad)
+        * np.sin(delta_lon / 2) ** 2
+    )
+
+    return float(
+        radius * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    )
+
+
+def build_delivery_features(request: DeliveryPredictionRequest):
+    """
+    Construct model input from the request.
+
+    If delivery metadata includes feature_columns, those columns determine
+    the feature order. Categorical values are kept as strings.
+    """
+    payload = request.model_dump(
+        by_alias=True,
+        exclude_none=True,
+    )
+
+    payload = {
+        normalize_column_name(key): value
+        for key, value in payload.items()
+    }
+
+    distance = payload.get("distance_km")
+
+    if distance is None:
+        distance = calculate_distance_km(
+            payload.get("restaurant_latitude"),
+            payload.get("restaurant_longitude"),
+            payload.get("delivery_location_latitude"),
+            payload.get("delivery_location_longitude"),
+        )
+
+    if distance is not None:
+        payload["distance_km"] = distance
+
+    ordered_time = parse_order_time(payload.get("time_ordered"))
+    picked_time = parse_order_time(payload.get("time_order_picked"))
+
+    if ordered_time is not None:
+        payload["order_hour"] = ordered_time.hour
+        payload["order_minute"] = ordered_time.minute
+
+    if ordered_time is not None and picked_time is not None:
+        delta_minutes = (
+            picked_time - ordered_time
+        ).total_seconds() / 60
+
+        if delta_minutes < 0:
+            delta_minutes += 24 * 60
+
+        payload["pickup_delay_minutes"] = delta_minutes
+
+    feature_columns = delivery_metadata.get(
+        "feature_columns",
+        delivery_metadata.get("features", []),
+    )
+
+    if isinstance(feature_columns, list) and feature_columns:
+        row = {}
+
+        for column in feature_columns:
+            normalized = normalize_column_name(column)
+            row[column] = payload.get(
+                normalized,
+                payload.get(column),
+            )
+
+        return pd.DataFrame([row], columns=feature_columns)
+
+    return pd.DataFrame([payload])
+
+
+@app.post("/predict-delivery")
+def predict_delivery(request: DeliveryPredictionRequest):
+    if delivery_model is None:
         raise HTTPException(
-            status_code=500,
+            status_code=503,
             detail=(
-                "Order history must contain customer_id "
-                "and cuisine_type columns."
+                "Delivery model is not loaded. Check "
+                "models/delivery_eta.joblib."
             ),
         )
 
-    return orders
+    try:
+        features = build_delivery_features(request)
 
+        # Pipeline artifacts generally expose predict().
+        if not hasattr(delivery_model, "predict"):
+            raise HTTPException(
+                status_code=500,
+                detail="The loaded delivery artifact has no predict() method.",
+            )
 
-def normalize_id(value) -> str:
-    """Normalize customer IDs read from CSV files."""
+        prediction = delivery_model.predict(features)
+        predicted_minutes = float(np.asarray(prediction).reshape(-1)[0])
 
-    value = str(value).strip()
+        return {
+            "predicted_delivery_time_minutes": round(
+                predicted_minutes, 2
+            ),
+            "unit": "minutes",
+        }
 
-    if value.endswith(".0"):
-        value = value[:-2]
-
-    return value
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"[ERROR] Delivery prediction failed: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Delivery prediction failed: {str(exc)}",
+        )
 
 
 # ============================================================
-# 8. ROOT ENDPOINT
+# RESTAURANT RECOMMENDATIONS
+# ============================================================
+
+@app.get("/restaurants/recommend")
+def recommend_restaurants(
+    cuisine: Optional[str] = Query(default=None),
+    location: Optional[str] = Query(default=None),
+    limit: int = Query(default=10, ge=1, le=50),
+):
+    restaurants = get_restaurants()
+
+    if restaurants.empty:
+        raise HTTPException(
+            status_code=503,
+            detail="Restaurant catalogue is unavailable.",
+        )
+
+    name_col = find_column(
+        restaurants,
+        ["restaurant_name", "restaurant", "name"],
+    )
+    cuisine_col = find_column(
+        restaurants,
+        ["cuisine", "cuisine_type", "cuisines"],
+    )
+    location_col = find_column(
+        restaurants,
+        ["location", "city", "address", "locality"],
+    )
+    rating_col = find_column(
+        restaurants,
+        ["rating", "ratings", "aggregate_rating"],
+    )
+
+    if name_col is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Restaurant name column is missing.",
+        )
+
+    df = restaurants.copy()
+    df["_original_index"] = df.index
+
+    if cuisine and cuisine_col:
+        df = df[
+            df[cuisine_col]
+            .astype(str)
+            .str.contains(cuisine, case=False, na=False)
+        ]
+
+    if location and location_col:
+        df = df[
+            df[location_col]
+            .astype(str)
+            .str.contains(location, case=False, na=False)
+        ]
+
+    if df.empty:
+        return {
+            "count": 0,
+            "recommendations": [],
+            "message": "No restaurants match the supplied filters.",
+        }
+
+    artifact = restaurant_model_artifact or {}
+
+    vectorizer = (
+        artifact.get("vectorizer")
+        if isinstance(artifact, dict)
+        else None
+    )
+    restaurant_matrix = (
+        artifact.get("restaurant_matrix")
+        if isinstance(artifact, dict)
+        else None
+    )
+    artifact_rows = (
+        artifact.get("restaurants")
+        if isinstance(artifact, dict)
+        else None
+    )
+
+    scores = {}
+
+    if (
+        vectorizer is not None
+        and restaurant_matrix is not None
+        and artifact_rows is not None
+        and cuisine
+    ):
+        try:
+            from sklearn.metrics.pairwise import cosine_similarity
+
+            query_vector = vectorizer.transform([cuisine])
+            similarities = cosine_similarity(
+                query_vector, restaurant_matrix
+            ).reshape(-1)
+
+            for original_index in df["_original_index"]:
+                if 0 <= int(original_index) < len(similarities):
+                    scores[int(original_index)] = float(
+                        similarities[int(original_index)]
+                    )
+        except Exception as exc:
+            print(
+                "[WARNING] Content-based recommendation failed: "
+                f"{exc}"
+            )
+
+    def score_restaurant(row):
+        index = int(row["_original_index"])
+        content_score = scores.get(index, 0.0)
+
+        rating = (
+            to_float(row.get(rating_col), 0.0)
+            if rating_col
+            else 0.0
+        )
+
+        # Normalize a rating commonly expressed on a 5-point scale.
+        rating_score = min(max(rating / 5.0, 0.0), 1.0)
+
+        return 0.65 * content_score + 0.35 * rating_score
+
+    df["_recommendation_score"] = df.apply(
+        score_restaurant, axis=1
+    )
+
+    df = df.sort_values(
+        "_recommendation_score",
+        ascending=False,
+    ).head(limit)
+
+    results = []
+
+    for _, row in df.iterrows():
+        item = {
+            "restaurant_name": str(row[name_col]),
+            "recommendation_score": round(
+                float(row["_recommendation_score"]), 4
+            ),
+        }
+
+        if cuisine_col:
+            item["cuisine"] = row.get(cuisine_col)
+
+        if location_col:
+            item["location"] = row.get(location_col)
+
+        if rating_col:
+            item["rating"] = row.get(rating_col)
+
+        results.append(item)
+
+    return {
+        "count": len(results),
+        "recommendations": results,
+    }
+
+
+# ============================================================
+# PREVIOUS-ORDER RECOMMENDATIONS
+# ============================================================
+
+@app.get("/restaurants/previous-orders")
+def recommend_from_previous_orders(
+    customer_id: str = Query(...),
+    limit: int = Query(default=10, ge=1, le=50),
+):
+    if previous_order_model_artifact is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Previous-order model artifact is not loaded.",
+        )
+
+    artifact = previous_order_model_artifact
+
+    if not isinstance(artifact, dict):
+        raise HTTPException(
+            status_code=500,
+            detail="Previous-order artifact has an unexpected format.",
+        )
+
+    # These fields come from the previous-order training artifact.
+    customer_column = artifact.get("customer_column")
+    restaurant_column = artifact.get("restaurant_column")
+    cuisine_column = artifact.get("cuisine_column")
+
+    # FIX: Restaurant catalogue column names must be obtained from the
+    # restaurant artifact or detected in the catalogue, not from the
+    # previous-order artifact's nonexistent "columns" dictionary.
+    restaurants = get_restaurants()
+
+    if restaurants.empty:
+        raise HTTPException(
+            status_code=503,
+            detail="Restaurant catalogue is unavailable.",
+        )
+
+    restaurant_columns = (
+        restaurant_model_artifact.get("columns", {})
+        if isinstance(restaurant_model_artifact, dict)
+        else {}
+    )
+
+    name_col = restaurant_columns.get("name")
+    cuisine_col = restaurant_columns.get("cuisine")
+    rating_col = restaurant_columns.get("rating")
+    location_col = restaurant_columns.get("location")
+
+    # Fall back to detecting the column names from the actual dataframe.
+    if not name_col or name_col not in restaurants.columns:
+        name_col = find_column(
+            restaurants,
+            ["restaurant_name", "restaurant", "name"],
+        )
+
+    if not cuisine_col or cuisine_col not in restaurants.columns:
+        cuisine_col = find_column(
+            restaurants,
+            ["cuisine", "cuisine_type", "cuisines"],
+        )
+
+    if not rating_col or rating_col not in restaurants.columns:
+        rating_col = find_column(
+            restaurants,
+            ["rating", "ratings", "aggregate_rating"],
+        )
+
+    if not location_col or location_col not in restaurants.columns:
+        location_col = find_column(
+            restaurants,
+            ["location", "city", "address", "locality"],
+        )
+
+    if name_col is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Restaurant name column is missing.",
+        )
+
+    # Match customer IDs as strings to avoid integer/string mismatches.
+    customer_counts = artifact.get(
+        "customer_restaurant_counts", {}
+    )
+    cuisine_preferences = artifact.get(
+        "customer_cuisine_preferences", {}
+    )
+
+    customer_key = str(customer_id).strip()
+
+    customer_restaurant_history = None
+    for stored_customer_id, history in customer_counts.items():
+        if str(stored_customer_id).strip() == customer_key:
+            customer_restaurant_history = history
+            break
+
+    customer_cuisine_history = None
+    for stored_customer_id, history in cuisine_preferences.items():
+        if str(stored_customer_id).strip() == customer_key:
+            customer_cuisine_history = history
+            break
+
+    if customer_restaurant_history is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No order history found for customer {customer_id}.",
+        )
+
+    # Support histories represented as either dictionaries or lists.
+    if isinstance(customer_restaurant_history, dict):
+        restaurant_counts = customer_restaurant_history
+    elif isinstance(customer_restaurant_history, list):
+        restaurant_counts = {}
+
+        for item in customer_restaurant_history:
+            if isinstance(item, dict):
+                restaurant_name = (
+                    item.get("restaurant_name")
+                    or item.get("restaurant")
+                    or item.get("name")
+                )
+                count = item.get("count", item.get("orders", 1))
+
+                if restaurant_name:
+                    restaurant_counts[str(restaurant_name)] = (
+                        to_float(count, 1.0)
+                    )
+    else:
+        restaurant_counts = {}
+
+    if isinstance(customer_cuisine_history, dict):
+        cuisine_counts = customer_cuisine_history
+    elif isinstance(customer_cuisine_history, list):
+        cuisine_counts = {
+            str(cuisine): 1
+            for cuisine in customer_cuisine_history
+        }
+    else:
+        cuisine_counts = {}
+
+    df = restaurants.copy()
+
+    # Calculate popularity from the saved restaurant catalogue where possible.
+    popularity = artifact.get("restaurant_popularity", {})
+    popularity_by_name = {
+        str(key).strip().lower(): to_float(value, 0.0)
+        for key, value in popularity.items()
+    }
+
+    previously_ordered = {
+        str(name).strip().lower()
+        for name in restaurant_counts.keys()
+    }
+
+    def history_score(row):
+        name = str(row.get(name_col, "")).strip()
+        normalized_name = name.lower()
+
+        restaurant_count = to_float(
+            restaurant_counts.get(name, 0),
+            0.0,
+        )
+
+        if restaurant_count == 0:
+            for stored_name, stored_count in restaurant_counts.items():
+                if str(stored_name).strip().lower() == normalized_name:
+                    restaurant_count = to_float(stored_count, 0.0)
+                    break
+
+        cuisine = (
+            str(row.get(cuisine_col, "")).strip()
+            if cuisine_col
+            else ""
+        )
+
+        cuisine_count = to_float(
+            cuisine_counts.get(cuisine, 0),
+            0.0,
+        )
+
+        if cuisine_count == 0:
+            for stored_cuisine, stored_count in cuisine_counts.items():
+                if str(stored_cuisine).strip().lower() == cuisine.lower():
+                    cuisine_count = to_float(stored_count, 0.0)
+                    break
+
+        rating = (
+            to_float(row.get(rating_col), 0.0)
+            if rating_col
+            else 0.0
+        )
+
+        popularity_score = popularity_by_name.get(
+            normalized_name, 0.0
+        )
+
+        return (
+            0.50 * restaurant_count
+            + 0.25 * cuisine_count
+            + 0.15 * min(max(rating / 5.0, 0.0), 1.0)
+            + 0.10 * popularity_score
+        )
+
+    df["_history_score"] = df.apply(history_score, axis=1)
+
+    # Prefer restaurants not already ordered when alternatives exist.
+    new_restaurants = df[
+        ~df[name_col]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .isin(previously_ordered)
+    ]
+
+    if not new_restaurants.empty:
+        df = new_restaurants
+
+    df = df.sort_values(
+        "_history_score",
+        ascending=False,
+    ).head(limit)
+
+    recommendations = []
+
+    for _, row in df.iterrows():
+        item = {
+            "restaurant_name": str(row[name_col]),
+            "recommendation_score": round(
+                float(row["_history_score"]), 4
+            ),
+        }
+
+        if cuisine_col:
+            item["cuisine"] = row.get(cuisine_col)
+
+        if rating_col:
+            item["rating"] = row.get(rating_col)
+
+        if location_col:
+            item["location"] = row.get(location_col)
+
+        recommendations.append(item)
+
+    return {
+        "customer_id": customer_id,
+        "count": len(recommendations),
+        "recommendations": recommendations,
+    }
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+@app.get("/health")
+def health_check():
+    restaurants = get_restaurants()
+
+    return {
+        "status": "ok",
+        "delivery_model_loaded": delivery_model is not None,
+        "restaurant_model_loaded": (
+            restaurant_model_artifact is not None
+        ),
+        "previous_order_model_loaded": (
+            previous_order_model_artifact is not None
+        ),
+        "restaurant_data_available": not restaurants.empty,
+        "order_history_available": not orders_df.empty,
+    }
+
+
+# ============================================================
+# ROOT
 # ============================================================
 
 @app.get("/")
 def root():
     return {
-        "message": "Food Ordering & Delivery ML API",
+        "message": "Food Ordering and Delivery ML API is running.",
         "docs": "/docs",
         "health": "/health",
     }
-
-
-# ============================================================
-# 9. HEALTH CHECK ENDPOINT
-# ============================================================
-
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "delivery_model_loaded": model is not None,
-        "restaurant_data_available": RESTAURANTS_PATH.exists(),
-    }
-
-
-# ============================================================
-# 10. DELIVERY TIME PREDICTION ENDPOINT
-# ============================================================
-
-@app.post("/predict-delivery")
-def predict_delivery(
-    request: DeliveryPredictionRequest,
-):
-    """Predict delivery duration in minutes."""
-
-    if model is None:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Delivery model is not trained or exported. "
-                "Run notebooks 01–04 to generate the model files."
-            ),
-        )
-
-    payload = (
-        request.model_dump()
-        if hasattr(request, "model_dump")
-        else request.dict()
-    )
-
-    features = build_features(
-        pd.DataFrame([payload])
-    )
-
-    prediction = float(
-        np.clip(
-            model.predict(features)[0],
-            1,
-            180,
-        )
-    )
-
-    return {
-        "predicted_delivery_minutes": round(
-            prediction,
-            1,
-        ),
-        "unit": "minutes",
-    }
-
-
-# ============================================================
-# 11. RESTAURANT RECOMMENDATION ENDPOINT
-# ============================================================
-
-@app.get("/restaurants/recommend")
-def recommend_restaurants(
-    cuisine: Optional[str] = None,
-    location: Optional[str] = None,
-    max_price: Optional[float] = Query(
-        default=None,
-        ge=0,
-    ),
-    min_rating: Optional[float] = Query(
-        default=None,
-        ge=0,
-        le=5,
-    ),
-    limit: int = Query(
-        default=10,
-        ge=1,
-        le=100,
-    ),
-):
-    """Filter and rank restaurants by rating and popularity."""
-
-    restaurants = get_restaurants().copy()
-
-    # Ensure expected columns exist.
-
-    for col in [
-        "restaurant_name",
-        "cuisine",
-        "area",
-        "location",
-    ]:
-        if col not in restaurants.columns:
-            restaurants[col] = ""
-
-        restaurants[col] = (
-            restaurants[col]
-            .fillna("")
-            .astype(str)
-        )
-
-    for col in [
-        "rating",
-        "rating_count",
-        "average_price",
-    ]:
-        if col not in restaurants.columns:
-            restaurants[col] = np.nan
-
-        restaurants[col] = pd.to_numeric(
-            restaurants[col],
-            errors="coerce",
-        )
-
-    restaurants["rating_count"] = (
-        restaurants["rating_count"].fillna(0)
-    )
-
-    ratings = restaurants["rating"].dropna()
-
-    global_mean = (
-        float(ratings.mean())
-        if not ratings.empty
-        else 0.0
-    )
-
-    # Bayesian-style ranking score.
-
-    m = (
-        float(
-            restaurants["rating_count"].quantile(0.75)
-        )
-        if not restaurants.empty
-        else 0.0
-    )
-
-    if m > 0:
-        denominator = restaurants["rating_count"] + m
-
-        restaurants["ranking_score"] = (
-            restaurants["rating_count"]
-            / denominator
-            * restaurants["rating"].fillna(global_mean)
-            + m
-            / denominator
-            * global_mean
-        )
-    else:
-        restaurants["ranking_score"] = (
-            restaurants["rating"].fillna(global_mean)
-        )
-
-    # Apply filters.
-
-    if cuisine:
-        restaurants = restaurants[
-            restaurants["cuisine"].str.contains(
-                cuisine,
-                case=False,
-                na=False,
-            )
-        ]
-
-    if location:
-        location_mask = (
-            restaurants["location"].str.contains(
-                location,
-                case=False,
-                na=False,
-            )
-            | restaurants["area"].str.contains(
-                location,
-                case=False,
-                na=False,
-            )
-        )
-
-        restaurants = restaurants[location_mask]
-
-    if max_price is not None:
-        restaurants = restaurants[
-            restaurants["average_price"].le(max_price)
-        ]
-
-    if min_rating is not None:
-        restaurants = restaurants[
-            restaurants["rating"].ge(min_rating)
-        ]
-
-    # Sort and limit results.
-
-    restaurants = restaurants.sort_values(
-        ["ranking_score", "rating_count"],
-        ascending=False,
-    ).head(limit)
-
-    output_columns = [
-        col
-        for col in [
-            "restaurant_name",
-            "cuisine",
-            "rating",
-            "rating_count",
-            "average_price",
-            "area",
-            "location",
-            "ranking_score",
-        ]
-        if col in restaurants.columns
-    ]
-
-    records = (
-        restaurants[output_columns]
-        .replace({np.nan: None})
-        .to_dict(orient="records")
-    )
-
-    return {
-        "count": len(records),
-        "restaurants": records,
-        "ranking": "static rating/popularity score",
-    }
-
-
-# ============================================================
-# 12. PREVIOUS-ORDER-BASED RESTAURANT RECOMMENDATION
-# ============================================================
-
-@app.get("/restaurants/previous-orders")
-def recommend_from_previous_orders(
-    customer_id: str = Query(
-        ...,
-        min_length=1,
-        description="Customer ID present in the order-history dataset",
-    ),
-    limit: int = Query(default=10, ge=1, le=100),
-):
-    """Personalize restaurant recommendations using a customer's order history.
-
-    The endpoint learns cuisine preferences from the customer's historical
-    orders, ranks cuisines by frequency, and combines recommendations from
-    the strongest preferences. It gracefully handles datasets that do not
-    contain order dates or restaurant names.
-    """
-    orders = get_order_history().copy()
-    orders["customer_id_normalized"] = orders["customer_id"].map(normalize_id)
-    customer_orders = orders[
-        orders["customer_id_normalized"].eq(normalize_id(customer_id))
-    ].copy()
-
-    if customer_orders.empty:
-        raise HTTPException(
-            status_code=404,
-            detail=(f"No previous orders found for customer_id '{customer_id}' "
-                    "in the available dataset."),
-        )
-
-    customer_orders["cuisine_type"] = (
-        customer_orders["cuisine_type"].fillna("").astype(str).str.strip()
-    )
-    customer_orders = customer_orders[customer_orders["cuisine_type"].ne("")]
-    if customer_orders.empty:
-        raise HTTPException(
-            status_code=404,
-            detail="Previous orders were found, but none had a recorded cuisine type.",
-        )
-
-    # If an order date/time column exists, sort newest-first and apply a mild
-    # recency weighting; otherwise use frequency only (works with simpler CSVs).
-    date_col = next((c for c in ["order_date", "Order_Date", "order_timestamp",
-                                  "order_time", "created_at", "timestamp"]
-                     if c in customer_orders.columns), None)
-    if date_col:
-        dates = pd.to_datetime(customer_orders[date_col], errors="coerce")
-        if dates.notna().any():
-            customer_orders["_order_date"] = dates
-            customer_orders = customer_orders.sort_values("_order_date")
-            # Newer rows receive larger weights. A simple rank weight avoids
-            # assumptions about the date format or elapsed-time scale.
-            customer_orders["_recency_weight"] = np.arange(
-                1, len(customer_orders) + 1, dtype=float
-            )
-        else:
-            customer_orders["_recency_weight"] = 1.0
-    else:
-        customer_orders["_recency_weight"] = 1.0
-
-    cuisine_stats = (
-        customer_orders.groupby("cuisine_type", as_index=False)
-        .agg(order_count=("cuisine_type", "size"),
-             preference_score=("_recency_weight", "sum"))
-        .sort_values(["preference_score", "order_count"], ascending=False)
-    )
-    top_cuisines = cuisine_stats.head(min(3, len(cuisine_stats)))
-
-    # Allocate a recommendation quota across the user's top cuisine preferences.
-    # Dedupe by restaurant name (or the full record if no name is available).
-    collected = []
-    seen = set()
-    for _, cuisine_row in top_cuisines.iterrows():
-        cuisine = str(cuisine_row["cuisine_type"])
-        quota = max(1, limit // len(top_cuisines))
-        result = recommend_restaurants(
-            cuisine=cuisine, location=None, max_price=None,
-            min_rating=None, limit=min(100, quota + 3),
-        )
-        for restaurant in result.get("restaurants", []):
-            name = str(restaurant.get("restaurant_name", "")).strip().casefold()
-            key = name if name else json.dumps(restaurant, sort_keys=True, default=str)
-            if key in seen:
-                continue
-            seen.add(key)
-            restaurant = dict(restaurant)
-            restaurant["matched_preferred_cuisine"] = cuisine
-            restaurant["customer_cuisine_order_count"] = int(cuisine_row["order_count"])
-            collected.append(restaurant)
-            if len(collected) >= limit:
-                break
-        if len(collected) >= limit:
-            break
-
-    return {
-        "customer_id": normalize_id(customer_id),
-        "total_historical_orders_with_cuisine": int(len(customer_orders)),
-        "preferred_cuisines": [
-            {"cuisine": str(row["cuisine_type"]),
-             "order_count": int(row["order_count"]),
-             "preference_score": round(float(row["preference_score"]), 3)}
-            for _, row in top_cuisines.iterrows()
-        ],
-        "count": len(collected),
-        "restaurants": collected,
-        "personalization": "ranked using customer cuisine frequency and, when available, order recency",
-        "message": (
-            "Recommendations are based on this customer's historical cuisine preferences."
-            if collected else
-            "Customer history was found, but no listed restaurants matched the customer's preferred cuisines."
-        ),
-    }
-
