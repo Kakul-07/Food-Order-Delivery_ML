@@ -91,7 +91,7 @@ def train_restaurant_model():
     df = df.dropna(subset=[name_col]).copy()
 
     df[name_col] = df[name_col].astype(str).str.strip()
-
+  
     df = df[
         df[name_col].ne("")
         & df[name_col].ne("nan")
